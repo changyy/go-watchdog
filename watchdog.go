@@ -5,6 +5,7 @@ import (
     "fmt"
     "database/sql"
     "sort"
+    "sync"
     "crypto/sha256"
     "encoding/json"
     _ "github.com/mattn/go-sqlite3"
@@ -27,10 +28,11 @@ const (
             resourceQueryChecksum TEXT NOT NULL,
             flag TEXT NULL,
             createtime DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updatetime DATETIME DEFAULT CURRENT_TIMESTAMP
+            updatetime DATETIME DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT u_id UNIQUE (resourceId,resourceChecksum,resourceQueryChecksum)
         );
-        CREATE UNIQUE INDEX u_id ON ? (resourceId,resourceChecksum,resourceQueryChecksum);
     `
+
     dbSchemaCreataTableTargetLog = `
         CREATE TABLE IF NOT EXISTS ` + dbTableWatchdogTargetLog + ` (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +51,13 @@ const (
     // https://sqlite.org/lang_conflict.html
     dbSchemaInsertTarget = `
         INSERT OR IGNORE INTO ` + dbTableWatchdogTarget + ` (resourceId, resourceContent, resourceHeader, resourceCookie, resourceChecksum, resourceQuery, resourceQueryChecksum) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `
+    dbSchemaUpdateTargetTimstamp = `UPDATE ` + dbTableWatchdogTarget + ` SET updatetime = CURRENT_TIMESTAMP WHERE resourceId = ? AND resourceChecksum = ? AND resourceQueryChecksum = ? `
+
+    dbSchemaSelectTargetRecordIDByChecksum = `SELECT id FROM ` + dbTableWatchdogTarget + ` WHERE resourceId = ? AND resourceChecksum = ? AND resourceQueryChecksum = ? `
+
+    dbSchemaInsertTargetLog = `
+        INSERT OR IGNORE INTO ` + dbTableWatchdogTargetLog + ` (resourceId, resourceContent, resourceHeader, resourceCookie, resourceChecksum, resourceQuery, resourceQueryChecksum) VALUES (?, ?, ?, ?, ?, ?, ?)
     `
 
     HTTPGetRequest = "GET"
@@ -139,11 +148,12 @@ func DefaultWatchdogResponseChecksumHandler(responseURL, responseContent string,
     }
     output = fmt.Sprintf("%x", sha256.Sum256([]byte(output)))
     return
-
 }
 
 type Watchdog struct {
     dbResource string
+    dbHandler *sql.DB
+    dbMutex sync.Mutex
     requestChecksumFunc WatchdogRequestChecksumHandler
     responseChecksumFunc WatchdogResponseChecksumHandler
 }
@@ -158,7 +168,25 @@ func (t *Watchdog) InitDBWithInMemory () (output bool) {
     return t.InitDB()
 }
 
+func (t *Watchdog) CloseDB() (output bool) {
+    t.dbMutex.Lock()
+
+    if t.dbResource == "" {
+        output = false
+    } else if t.dbHandler != nil {
+        if t.dbResource == ":memory:" {
+            log.Println("[WARNING] Use InitDBWithInMemory method")
+        }
+        t.dbHandler.Close()
+        t.dbHandler = nil
+    }
+    output = true
+    t.dbMutex.Unlock()
+    return
+}
+
 func (t *Watchdog) InitDB () (output bool) {
+    t.dbMutex.Lock()
     if t.dbResource == "" {
         log.Println("[WARNING] Use InitDBWithInMemory method")
         t.dbResource = ":memory:"
@@ -168,14 +196,21 @@ func (t *Watchdog) InitDB () (output bool) {
     if err != nil {
         log.Fatalln(err)
     }
-    defer db.Close()
+    t.dbHandler = db
+    if t.dbResource != ":memory:" {
+        //defer db.Close()
+        defer func(){
+            t.dbHandler.Close()
+            t.dbHandler = nil
+        }()
+    }
 
     output = true
     for _, createTable := range([]string{
         dbSchemaCreataTableTarget,
         dbSchemaCreataTableTargetLog,
     }) {
-        if stmt, err := db.Prepare(createTable); err != nil {
+        if stmt, err := t.dbHandler.Prepare(createTable); err != nil {
             log.Println(err)
         } else {
             defer stmt.Close()
@@ -185,6 +220,7 @@ func (t *Watchdog) InitDB () (output bool) {
             }
         }
     }
+    t.dbMutex.Unlock()
     return 
 }
 
@@ -204,60 +240,137 @@ func (t *Watchdog) Watch (requestURL, requestMethod string, requestHeader, reque
         responseChecksum = DefaultWatchdogResponseChecksumHandler(responseURL, responseContent, requestHeader, requestCookie)
     }
 
+    queryInfoJSON, err := json.Marshal(map[string]interface{}{
+        "request_url": requestURL, 
+        "request_header": requestHeader,
+        "request_cookie": requestCookie,
+    })
+    if err != nil {
+        log.Println("queryInfoJSON error:", err)
+        output = false
+        return
+    }
+
+    responseHeaderJSON, err := json.Marshal(responseHeader)
+    if err != nil {
+        log.Println("responseHeaderJSON error:", err)
+        output = false
+        return output
+    }
+
+    responseCookieJSON, err := json.Marshal(responseCookie)
+    if err != nil {
+        log.Println("responseCookieJSON error:", err)
+        output = false
+        return output
+    }
+
     if t.dbResource == "" {
         log.Println("[ERROR] Use InitDB First")
         output = false
         return 
     }
 
-    db, err := sql.Open("sqlite3", t.dbResource)
-    if err != nil {
-        log.Fatalln(err)
-    }
-    defer db.Close()
+    t.dbMutex.Lock()
+    defer t.dbMutex.Unlock()
 
-    if stmt, err := db.Prepare(dbSchemaInsertTarget); err != nil {
-            log.Println(err, ", raw: ", dbSchemaInsertTarget)
+    if t.dbHandler == nil {
+        db, err := sql.Open("sqlite3", t.dbResource)
+        if err != nil {
+            log.Println("[ERROR] sql.Open error:", err)
             output = false
-            return output
+            return
+        }
+        t.dbHandler = db
+    }
+
+    if stmt, err := t.dbHandler.Prepare(dbSchemaSelectTargetRecordIDByChecksum); err != nil {
+            log.Println(err, ", raw: ", dbSchemaSelectTargetRecordIDByChecksum)
+            output = false
+            return
     } else {
-            defer stmt.Close()
-
-            queryInfo := map[string]interface{}{
-                "url": requestURL, 
-                "header": requestHeader,
-                "cookie": requestCookie,
-            }
-            queryInfoJSON, err := json.Marshal(queryInfo)
-             if err != nil {
-                log.Println("queryInfoJSON error:", err)
-                output = false
-                return output
-            }
-
-            responseHeaderJSON, err := json.Marshal(responseHeader)
-            if err != nil {
-                log.Println("responseHeaderJSON error:", err)
-                output = false
-                return output
-            }
-
-            responseCookieJSON, err := json.Marshal(responseCookie)
-            if err != nil {
-                log.Println("responseCookieJSON error:", err)
-                output = false
-                return output
-            }
-            
-            if _, err = stmt.Exec(requestURL, responseContent, responseHeaderJSON, responseCookieJSON, responseChecksum, queryInfoJSON, requestChecksum); err != nil {
+        defer stmt.Close()
+        recordId := ""
+        if err := stmt.QueryRow(requestURL, responseChecksum, requestChecksum).Scan(&recordId); err != nil {
+            if err != sql.ErrNoRows {
                 log.Println("stmt.Exec error:", err)
+                output = false
+                return
+            } else {
+                // Insert
+                if insertStmt, err := t.dbHandler.Prepare(dbSchemaInsertTarget); err != nil {
+                    log.Println(err, ", raw: ", dbSchemaInsertTarget)
+                    output = false
+                    return
+                } else {
+                    defer insertStmt.Close()
+                    if res, err := insertStmt.Exec(requestURL, responseContent, responseHeaderJSON, responseCookieJSON, responseChecksum, queryInfoJSON, requestChecksum); err != nil {
+                        log.Println("insertStmt.Exec error:", err)
+                        output = false
+                        return
+                    } else if recordID, err := res.LastInsertId(); err != nil {
+                        log.Println("insertStmt res.LastInsertId() error:", err)
+                        output = false
+                        return output
+                    } else if recordID == 0 {   // Need Update
+                        log.Println("insertStmt res.LastInsertId() == 0")
+                        output = false
+                        return output
+                    } else {
+                        output = true
+                    }
+                }
+            }
+        } else {
+            // Updated
+            if updateStmt, err := t.dbHandler.Prepare(dbSchemaUpdateTargetTimstamp); err != nil {
+                log.Println("db.Prepare dbSchemaUpdateTargetTimstamp error:", err, ", sql:", dbSchemaUpdateTargetTimstamp)
                 output = false
                 return output
             } else {
+                defer updateStmt.Close()
+                if _, err = updateStmt.Exec(requestURL, responseChecksum, requestChecksum); err != nil {
+                    log.Println("dbSchemaUpdateTargetTimstamp execute error:", err)
+                    output = false
+                    return output
+                }
                 output = true
             }
+        }
     }
-
     return
+    // INSERT and Update
+    //if stmt, err := t.dbHandler.Prepare(dbSchemaInsertTarget); err != nil {
+    //        log.Println(err, ", raw: ", dbSchemaInsertTarget)
+    //        output = false
+    //        return
+    //} else {
+    //        defer stmt.Close()
+    //        
+    //        if res, err := stmt.Exec(requestURL, responseContent, responseHeaderJSON, responseCookieJSON, responseChecksum, queryInfoJSON, requestChecksum); err != nil {
+    //            log.Println("stmt.Exec error:", err)
+    //            output = false
+    //            return
+    //        } else if recordID, err := res.LastInsertId(); err != nil {
+    //            log.Println("res.LastInsertId() error:", err)
+    //            output = false
+    //            return output
+    //        } else if recordID == 0 {   // Need Update
+    //            if updateStmt, err := t.dbHandler.Prepare(dbSchemaUpdateTargetTimstamp); err != nil {
+    //                log.Println("db.Prepare dbSchemaUpdateTargetTimstamp error:", err, ", sql:", dbSchemaUpdateTargetTimstamp)
+    //                output = false
+    //                return output
+    //            } else {
+    //                defer updateStmt.Close()
+    //                if _, err = updateStmt.Exec(requestURL, responseChecksum, requestChecksum); err != nil {
+    //                    log.Println("dbSchemaUpdateTargetTimstamp execute error:", err)
+    //                    output = false
+    //                    return output
+    //                }
+    //            }
+    //        }
+    //        output = true
+    //}
+    //return
 }
 

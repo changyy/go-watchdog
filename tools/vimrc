@@ -1,0 +1,12 @@
+try
+    source $VIM/vimrc 
+catch
+    echo "\$VIM/vimrc not found"
+endtry
+
+syntax on
+set hls 
+set nu
+set tabstop=4
+set shiftwidth=4
+set expandtab
